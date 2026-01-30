@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv
+venv/
+# Secrets
+credentials.json
+token.json
+# Node
+node_modules/
+dist/
+build/
+
+# Logs & recordings
+*.log
+recordings/
+transcripts/
+
+# OS
+.DS_Store
+.env
