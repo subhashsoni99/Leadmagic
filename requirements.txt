@@ -1,0 +1,20 @@
+# Core
+pipecat-ai[webrtc,deepgram,aws]
+boto3
+aiobotocore
+python-dotenv
+loguru
+
+# Date / parsing helpers (optional but useful)
+python-dateutil
+
+# Audio / ML dependencies
+torch
+numpy
+
+# Web frameworks (if using FastAPI websocket transport)
+fastapi
+uvicorn
+
+# If using Daily WebRTC
+daily-python
