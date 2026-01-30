@@ -1,7 +1,8 @@
 import os
-from datetime import datetime
-import boto3
+import uuid
+from datetime import datetime, timedelta, date as date_cls
 
+import boto3
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -30,8 +31,7 @@ from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.services.aws.llm import AWSBedrockLLMService
 from pipecat.services.deepgram.tts import DeepgramTTSService
-import uuid
-from datetime import timedelta
+
 load_dotenv(override=True)
 
 # =========================
@@ -50,28 +50,70 @@ dynamodb = boto3.resource(
 )
 
 # =========================
-# Tool Functions (REAL)
+# Helpers
+# =========================
+
+def normalize_date_time(date_str: str, time_str: str) -> tuple[str, str]:
+    """
+    Guarantees current year and proper ISO formatting.
+    Returns (YYYY-MM-DD, HH:MM)
+    """
+    today = date_cls.today()
+
+    parts = date_str.split("-")
+    if len(parts) == 3:
+        year, month, day = parts
+        if int(year) < today.year:
+            year = str(today.year)
+    else:
+        year = str(today.year)
+        month = f"{today.month:02d}"
+        day = f"{today.day:02d}"
+
+    clean_date = f"{year}-{month}-{day}"
+    clean_time = time_str[:5]
+
+    return clean_date, clean_time
+
+
+def humanize_datetime(date_str: str, time_str: str) -> str:
+    """
+    Convert ISO to natural spoken English for TTS.
+    Example: 2026-01-30 + 10:00 -> January 30th at 10 AM
+    """
+    dt = datetime.fromisoformat(f"{date_str}T{time_str}:00")
+
+    day = dt.day
+    suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+
+    spoken_date = dt.strftime(f"%B {day}{suffix}")
+    spoken_time = dt.strftime("%-I:%M %p").replace(":00", "")
+
+    return f"{spoken_date} at {spoken_time}"
+
+
+# =========================
+# Tool Functions
 # =========================
 
 async def check_availability(params: FunctionCallParams):
     table = dynamodb.Table(BOOKINGS_TABLE)
 
-    date = params.arguments["date"]
-    time = params.arguments["time"]
+    raw_date = params.arguments["date"]
+    raw_time = params.arguments["time"]
 
-    # Build ISO start_time
-    start_time_prefix = f"{date}T{time}"
+    date_key, time_key = normalize_date_time(raw_date, raw_time)
 
-    logger.info(f"[TOOL] check_availability scan: {start_time_prefix}")
+    logger.info(f"[TOOL] check_availability: {date_key} {time_key}")
 
-    resp = table.scan(
-        FilterExpression="begins_with(start_time, :st)",
-        ExpressionAttributeValues={
-            ":st": start_time_prefix
+    resp = table.get_item(
+        Key={
+            "date": date_key,
+            "time": time_key,
         }
     )
 
-    is_available = resp.get("Count", 0) == 0
+    is_available = "Item" not in resp
 
     await params.result_callback({
         "available": is_available
@@ -81,41 +123,45 @@ async def check_availability(params: FunctionCallParams):
 async def create_booking(params: FunctionCallParams):
     table = dynamodb.Table(BOOKINGS_TABLE)
 
-    date = params.arguments["date"]
-    time = params.arguments["time"]
+    raw_date = params.arguments["date"]
+    raw_time = params.arguments["time"]
     name = params.arguments.get("name", "unknown")
 
-    # Build ISO start time
-    start_time_str = f"{date}T{time}:00"
+    date_key, time_key = normalize_date_time(raw_date, raw_time)
 
-    # Parse to datetime
-    start_dt = datetime.fromisoformat(start_time_str)
-
-    # Add 30 minutes
+    start_dt = datetime.fromisoformat(f"{date_key}T{time_key}:00")
     end_dt = start_dt + timedelta(minutes=30)
 
-    # Convert back to ISO strings
-    start_time = start_dt.isoformat()
-    end_time = end_dt.isoformat()
-
     appointment_id = str(uuid.uuid4())
+    spoken_when = humanize_datetime(date_key, time_key)
+
+    logger.info(f"[TOOL] create_booking: {date_key} {time_key} {name}")
 
     table.put_item(
         Item={
+            "date": date_key,
+            "time": time_key,
             "appointment_id": appointment_id,
-            "start_time": start_time,
-            "end_time": end_time,
+            "start_time": start_dt.isoformat(),
+            "end_time": end_dt.isoformat(),
             "name": name,
             "created_at": datetime.utcnow().isoformat(),
+        },
+        ConditionExpression="attribute_not_exists(#d) AND attribute_not_exists(#t)",
+        ExpressionAttributeNames={
+            "#d": "date",
+            "#t": "time",
         }
     )
 
     await params.result_callback({
         "status": "confirmed",
         "appointment_id": appointment_id,
-        "start_time": start_time,
+        "date": date_key,
+        "time": time_key,
+        "start_time": start_dt.isoformat(),
+        "spoken_when": spoken_when,   # 👈 HUMAN SPEECH
     })
-
 
 
 # =========================
@@ -145,7 +191,7 @@ transport_params = {
 # =========================
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    logger.info("Starting Booking Bot")
+    logger.info("Starting Booking Bot (Human Voice Mode)")
 
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
@@ -156,7 +202,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     llm = AWSBedrockLLMService(
         region_name=AWS_REGION,
-        #model="anthropic.claude-3-sonnet-20240229-v1:0",
         model=os.getenv("BEDROCK_NOVA_PRO_PROFILE_ARN"),
         temperature=0.2,
         aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -165,7 +210,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         tool_choice="auto",
     )
 
-    # Register booking tools
     llm.register_function("check_availability", check_availability)
     llm.register_function("create_booking", create_booking)
 
@@ -181,14 +225,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         name="check_availability",
         description="Check if an appointment slot is available",
         properties={
-            "date": {
-                "type": "string",
-                "description": "Appointment date in YYYY-MM-DD format",
-            },
-            "time": {
-                "type": "string",
-                "description": "Appointment time, e.g. 15:00",
-            },
+            "date": {"type": "string", "description": "YYYY-MM-DD"},
+            "time": {"type": "string", "description": "HH:MM"},
         },
         required=["date", "time"],
     )
@@ -197,45 +235,46 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         name="create_booking",
         description="Create and save an appointment booking",
         properties={
-            "date": {
-                "type": "string",
-                "description": "Appointment date in YYYY-MM-DD format",
-            },
-            "time": {
-                "type": "string",
-                "description": "Appointment time, e.g. 15:00",
-            },
-            "name": {
-                "type": "string",
-                "description": "Customer name",
-            },
+            "date": {"type": "string", "description": "YYYY-MM-DD"},
+            "time": {"type": "string", "description": "HH:MM"},
+            "name": {"type": "string", "description": "Customer name"},
         },
         required=["date", "time"],
     )
 
     tools = ToolsSchema(
-        standard_tools=[
-            check_availability_function,
-            create_booking_function,
-        ]
+        standard_tools=[check_availability_function, create_booking_function]
     )
 
     # =========================
-    # System Prompt (IMPORTANT)
+    # System Prompt (VOICE SAFE)
     # =========================
+
+    today_str = date_cls.today().isoformat()
 
     messages = [
         {
             "role": "system",
             "content": (
+                f"Today is {today_str}. "
                 "You are a voice appointment booking assistant. "
-                "When a user wants to book an appointment, you MUST "
-                "first call check_availability with the requested date and time. "
-                "If available, confirm and then call create_booking. "
-                "If not available, politely ask for another date or time. "
-                "Speak naturally and briefly."
+
+                "IMPORTANT: "
+                "Use ISO format ONLY for tool calls. "
+                "For speaking to the user, ALWAYS use natural human language. "
+                "Never read dates like 2026-01-30 or times like 10:00. "
+                "Always say them like 'January 30th at 10 AM'. "
+
+                "If the user gives a date without a year, assume the current year. "
+                "Resolve relative dates like tomorrow based on today. "
+
+                "When booking, you MUST first call check_availability. "
+                "If available, then call create_booking. "
+                "If not available, politely ask for another time. "
+                "Speak like a friendly human receptionist."
             ),
         },
+        {"role": "user", "content": "Hello"}
     ]
 
     context = LLMContext(messages, tools)
